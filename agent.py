@@ -16,9 +16,50 @@ from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
 
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
-TONE_ADDENDUM = ""                       # ✏️ Build 4, step 4.1, intelligence goal
+TONE_ADDENDUM = """
+
+=== TONE SAFETY — READ BEFORE RUNNING THE STANDARD PROCESS ===
+
+These rules override the standard six-step process when the customer's
+message signals one of three situations. Check for them first.
+
+1. LEGAL THREAT OR HOSTILE ABUSE
+   If the message contains a threat of legal action, uses abusive language,
+   or is hostile in a way that no entitlements answer can defuse:
+   - Acknowledge the complaint in one sentence. Do not minimise it.
+   - Call escalate_to_human immediately with a clear reason.
+   - Do not run check_policy, issue_voucher, or offer a refund pathway.
+   - Do not produce an entitlements rundown as though nothing was said.
+
+2. EMOTIONAL DISTRESS (grief, despair, crisis)
+   Trigger words: funeral, died, death, lost my [person], passing, tragedy,
+   emergency, hospital, cancer, gravely ill, miscarriage, or any message
+   that names a bereavement or personal crisis.
+
+   When these words appear, follow this exact reply structure — no exceptions:
+
+   PARAGRAPH 1 (mandatory, written before anything else in your reply):
+     Express genuine sorrow about the specific thing named. Use the actual
+     words from the customer's message. "I'm so sorry about the loss of your
+     father" — not "I understand this is difficult." Name the specific thing.
+     No flight numbers, no cause codes, no options, no bullets in this paragraph.
+
+   PARAGRAPH 2 onwards: proceed with the standard process and practical help.
+
+   DO NOT start your reply with "Here are your options", "Here's where things
+   stand", or any variant that leads with policy before the acknowledgment.
+   The acknowledgment paragraph must be the literal first text in your reply.
+
+3. OFFENSIVE OR DISCRIMINATORY LANGUAGE
+   If the message contains slurs, discriminatory remarks, or demands framed
+   around the agent's identity (language, nationality, etc.):
+   - Do not engage with or repeat the offensive content.
+   - Acknowledge the frustration briefly and call escalate_to_human.
+   - Do not run check_policy or offer entitlements into this situation.
+"""                                      # ✏️ Build 4, step 4.1, intelligence goal
 EXTRA_TOOLS: List[Dict[str, Any]] = []   # ✏️ Build 2, step 2.1: schemas for the tools you add
 LOCAL_TOOLS: Dict[str, Any] = {}         # ✏️ Build 2, step 2.1: the functions behind them
+# next_available_day is served exclusively via MCP (support/mcp_server.py) for step 2.2
 
 
 def text_of(response) -> str:
@@ -52,25 +93,51 @@ def tool_results(response) -> List[Dict[str, Any]]:
     return results
 
 
+_DISTRESS_SIGNALS = ("funeral", "died", "death", "passed away", "passing", "loss of my",
+                     "emergency", "hospital", "cancer", "grief", "bereavement")
+
+
+def _distress_reminder(message: str) -> list:
+    """Return a reminder block if the message contains distress signals, else empty list."""
+    low = message.lower()
+    if not any(kw in low for kw in _DISTRESS_SIGNALS):
+        return []
+    return [{"type": "text",
+             "text": ("[TONE REMINDER] The customer's message contains a bereavement or crisis. "
+                      "Your reply MUST begin with a standalone paragraph that names the specific "
+                      "loss or situation (e.g. the father, the funeral). No flight numbers, "
+                      "no policy, no bullets in that first paragraph. "
+                      "Then continue with practical help.")}]
+
+
 def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏️ Build 1, step 1.2
     """Run the tool loop until Claude stops asking for tools. Return its final text."""
     client, tracer = new_session()
     tools = tool_list()
+    reminder = _distress_reminder(message)
     messages = [
         {"role": "user", "content": f"PNR {pnr}, last name {last_name}. {message}"},
     ]
 
+    # Stable system content is cached; dynamic timestamp is a separate uncached block.
+    system = [
+        {"type": "text", "text": TONE_ADDENDUM + SYSTEM_PROMPT,
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": runtime_preamble()},
+    ]
+
     response = client.messages.create(
-        model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
+        model=MODEL, max_tokens=4096, system=system,
         thinking={"type": "adaptive"}, tools=tools, messages=messages,
     )
 
     turns = 1
     while response.stop_reason == "tool_use" and turns < MAX_TOOL_CALLS:
         messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results(response)})
+        # Append distress reminder alongside tool results so it's fresh at reply time.
+        messages.append({"role": "user", "content": tool_results(response) + reminder})
         response = client.messages.create(
-            model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
+            model=MODEL, max_tokens=4096, system=system,
             thinking={"type": "adaptive"}, tools=tools, messages=messages,
         )
         turns += 1
@@ -81,7 +148,12 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
 def tool_list() -> List[Dict[str, Any]]:                   # ✏️ Build 2, step 2.2
     """Given. Exactly what Claude is offered on every turn; run.py --show-tools
     prints this list."""
-    return build_tools() + EXTRA_TOOLS + mcp_client.tools()
+    seen, tools = set(), []
+    for t in build_tools() + EXTRA_TOOLS + mcp_client.tools():
+        if t["name"] not in seen:
+            seen.add(t["name"])
+            tools.append(t)
+    return tools
 
 
 # ──────────────────────────────────────────────────────────────────────────────
