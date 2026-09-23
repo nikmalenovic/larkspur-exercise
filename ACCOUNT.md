@@ -1,8 +1,8 @@
 # ACCOUNT.md
 
-Account:
-Workflow:
-Date:
+Account: Architects
+Workflow: Cost Optimization
+Date: Sep 23rd 2026
 
 Three lines, and nobody can write them for you.
 
